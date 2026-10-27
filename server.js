@@ -2,68 +2,107 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+const { Pool } = require('pg');
 
 // Config
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
-const INVESTOR_PASSWORD = process.env.INVESTOR_PASSWORD;
-const TOKEN_EXPIRY = '1h';
-const SALT_ROUNDS = 10;
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'admin@example.com').toLowerCase();
+const DATABASE_URL = process.env.DATABASE_URL;
+const ALLOWED_ORIGIN =
+  process.env.ALLOWED_ORIGIN || 'https://my-investor-dashboard.netlify.app';
 
-if (!JWT_SECRET || !ADMIN_PASSWORD || !INVESTOR_PASSWORD) {
-  throw new Error('Set JWT_SECRET, ADMIN_PASSWORD and INVESTOR_PASSWORD.');
+if (!JWT_SECRET || !ADMIN_PASSWORD || !DATABASE_URL) {
+  throw new Error('Set JWT_SECRET, ADMIN_PASSWORD and DATABASE_URL.');
 }
 
+const TOKEN_EXPIRY = '1h';
+const SALT_ROUNDS = 10;
 const ROLES = { INVESTOR: 'investor', ADMIN: 'admin' };
 const STATUSES = ['active', 'frozen', 'pending_verification'];
 const TX_TYPES = ['deposit', 'withdrawal', 'profit', 'loss'];
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-// In-memory database (resets on restart; swap for a real DB before real use)
-const users = [
-  {
-    id: 1,
-    email: 'investor@example.com',
-    passwordHash: bcrypt.hashSync(INVESTOR_PASSWORD, SALT_ROUNDS),
-    role: ROLES.INVESTOR,
-    allowedAssets: ['BTC', 'ETH', 'AAPL'],
-    accountStatus: 'active',
-    ledger: [],
-  },
-  {
-    id: 2,
-    email: 'admin@example.com',
-    passwordHash: bcrypt.hashSync(ADMIN_PASSWORD, SALT_ROUNDS),
-    role: ROLES.ADMIN,
-  },
-];
+// Database
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
 
-const findUserById = (id) => users.find((u) => u.id === Number(id));
-const findUserByEmail = (email) =>
-  users.find((u) => u.email.toLowerCase() === String(email).toLowerCase());
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'investor',
+      account_status TEXT NOT NULL DEFAULT 'pending_verification',
+      allowed_assets TEXT[] NOT NULL DEFAULT ARRAY['BTC','ETH','AAPL'],
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS ledger (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      type TEXT NOT NULL,
+      amount NUMERIC(14,2) NOT NULL CHECK (amount > 0),
+      note TEXT NOT NULL,
+      recorded_by INTEGER NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  const hash = await bcrypt.hash(ADMIN_PASSWORD, SALT_ROUNDS);
+  await pool.query(
+    `INSERT INTO users (email, password_hash, role, account_status)
+     VALUES ($1, $2, 'admin', 'active')
+     ON CONFLICT (email)
+     DO UPDATE SET password_hash = EXCLUDED.password_hash, role = 'admin'`,
+    [ADMIN_EMAIL, hash]
+  );
+}
 
 // Balances are always derived from the ledger, never typed in directly
-const round2 = (n) => Math.round(n * 100) / 100;
+const SUMMARY_SQL = `
+  COALESCE(SUM(CASE WHEN l.type = 'deposit' THEN l.amount END), 0) AS deposited,
+  COALESCE(SUM(CASE WHEN l.type = 'withdrawal' THEN l.amount END), 0) AS withdrawn,
+  COALESCE(SUM(CASE WHEN l.type = 'profit' THEN l.amount
+                    WHEN l.type = 'loss' THEN -l.amount END), 0) AS profit
+`;
 
-const summarize = (user) => {
-  let deposited = 0;
-  let withdrawn = 0;
-  let profit = 0;
-  for (const tx of user.ledger) {
-    if (tx.type === 'deposit') deposited += tx.amount;
-    else if (tx.type === 'withdrawal') withdrawn += tx.amount;
-    else if (tx.type === 'profit') profit += tx.amount;
-    else if (tx.type === 'loss') profit -= tx.amount;
-  }
+const toSummary = (row) => {
+  const deposited = Number(row.deposited);
+  const withdrawn = Number(row.withdrawn);
+  const profit = Number(row.profit);
   return {
-    totalDeposited: round2(deposited),
-    totalWithdrawn: round2(withdrawn),
-    totalProfit: round2(profit),
-    portfolioValue: round2(deposited - withdrawn + profit),
+    totalDeposited: deposited,
+    totalWithdrawn: withdrawn,
+    totalProfit: profit,
+    portfolioValue: Math.round((deposited - withdrawn + profit) * 100) / 100,
   };
 };
 
-// Middleware
+const getSummary = async (client, userId) => {
+  const { rows } = await client.query(
+    `SELECT ${SUMMARY_SQL} FROM ledger l WHERE l.user_id = $1`,
+    [userId]
+  );
+  return toSummary(rows[0]);
+};
+
+// Middleware & helpers
+const wrap = (fn) => (req, res, next) =>
+  fn(req, res, next).catch((err) => {
+    console.error(err);
+    res.status(500).json({ message: 'Internal server error.' });
+  });
+
+const signToken = (user) =>
+  jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, {
+    expiresIn: TOKEN_EXPIRY,
+  });
+
 const authenticateToken = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) {
@@ -78,115 +117,204 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-const requireAdmin = (req, res, next) => {
-  const current = findUserById(req.user.id);
-  if (!current || current.role !== ROLES.ADMIN) {
+const requireAdmin = wrap(async (req, res, next) => {
+  const { rows } = await pool.query('SELECT role FROM users WHERE id = $1', [
+    req.user.id,
+  ]);
+  if (!rows[0] || rows[0].role !== ROLES.ADMIN) {
     return res.status(403).json({ message: 'Admin access required.' });
   }
   next();
-};
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many attempts. Please try again in 15 minutes.' },
+});
 
 // App setup
 const app = express();
+app.set('trust proxy', 1);
 app.use(express.json());
-app.use(cors());
+app.use(cors({ origin: ALLOWED_ORIGIN }));
 
-// Auth
-app.post('/api/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ message: 'Email and password are required.' });
-    }
-    const user = findUserByEmail(email);
-    const valid = user && (await bcrypt.compare(password, user.passwordHash));
-    if (!valid) {
-      return res.status(401).json({ message: 'Invalid email or password.' });
-    }
-    const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, {
-      expiresIn: TOKEN_EXPIRY,
-    });
-    res.json({ token, role: user.role });
-  } catch (err) {
-    res.status(500).json({ message: 'Internal server error during login.' });
+// Auth routes
+app.post('/api/signup', authLimiter, wrap(async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+
+  if (!EMAIL_RE.test(email) || email.length > 254) {
+    return res.status(400).json({ message: 'Enter a valid email address.' });
   }
-});
+  if (password.length < 8 || password.length > 72) {
+    return res
+      .status(400)
+      .json({ message: 'Password must be 8 to 72 characters.' });
+  }
 
-// Investor: sees balance, profit and their full transaction history
-app.get('/api/dashboard', authenticateToken, (req, res) => {
-  const user = findUserById(req.user.id);
+  const hash = await bcrypt.hash(password, SALT_ROUNDS);
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO users (email, password_hash, role, account_status)
+       VALUES ($1, $2, 'investor', 'pending_verification')
+       RETURNING id, role`,
+      [email, hash]
+    );
+    res.status(201).json({ token: signToken(rows[0]), role: rows[0].role });
+  } catch (err) {
+    if (err.code === '23505') {
+      return res
+        .status(409)
+        .json({ message: 'An account with this email already exists.' });
+    }
+    throw err;
+  }
+}));
+
+app.post('/api/login', authLimiter, wrap(async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+
+  if (!email || !password) {
+    return res.status(400).json({ message: 'Email and password are required.' });
+  }
+
+  const { rows } = await pool.query(
+    'SELECT id, role, password_hash FROM users WHERE email = $1',
+    [email]
+  );
+  const user = rows[0];
+  const valid = user && (await bcrypt.compare(password, user.password_hash));
+
+  if (!valid) {
+    return res.status(401).json({ message: 'Invalid email or password.' });
+  }
+  res.json({ token: signToken(user), role: user.role });
+}));
+
+// Investor routes
+app.get('/api/dashboard', authenticateToken, wrap(async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT id, role, account_status, allowed_assets FROM users WHERE id = $1',
+    [req.user.id]
+  );
+  const user = rows[0];
+
   if (!user) return res.status(404).json({ message: 'User not found.' });
   if (user.role === ROLES.ADMIN) {
-    return res.status(403).json({ message: 'Admins must use management endpoints.' });
+    return res
+      .status(403)
+      .json({ message: 'Admins must use management endpoints.' });
   }
+
+  const summary = await getSummary(pool, user.id);
+  const tx = await pool.query(
+    `SELECT id, type, amount, note, created_at AS date
+     FROM ledger WHERE user_id = $1 ORDER BY id DESC`,
+    [user.id]
+  );
+
   res.json({
-    ...summarize(user),
-    allowedAssets: user.allowedAssets,
-    status: user.accountStatus,
-    transactions: [...user.ledger].reverse(),
+    ...summary,
+    allowedAssets: user.allowed_assets,
+    status: user.account_status,
+    transactions: tx.rows.map((t) => ({ ...t, amount: Number(t.amount) })),
   });
-});
+}));
 
-// Admin: list investors with derived balances
-app.get('/api/admin/investors', authenticateToken, requireAdmin, (req, res) => {
-  const investors = users
-    .filter((u) => u.role === ROLES.INVESTOR)
-    .map((u) => ({
-      id: u.id,
-      email: u.email,
-      status: u.accountStatus,
-      ...summarize(u),
-    }));
-  res.json({ investors });
-});
+// Admin routes
+app.get('/api/admin/investors', authenticateToken, requireAdmin, wrap(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT u.id, u.email, u.account_status AS status, ${SUMMARY_SQL}
+     FROM users u
+     LEFT JOIN ledger l ON l.user_id = u.id
+     WHERE u.role = 'investor'
+     GROUP BY u.id
+     ORDER BY u.id`
+  );
+  res.json({
+    investors: rows.map((r) => ({
+      id: r.id,
+      email: r.email,
+      status: r.status,
+      ...toSummary(r),
+    })),
+  });
+}));
 
-// Admin: record a deposit, withdrawal, profit or loss (note is required)
-app.post('/api/admin/transaction', authenticateToken, requireAdmin, (req, res) => {
+app.post('/api/admin/transaction', authenticateToken, requireAdmin, wrap(async (req, res) => {
   const { userId, type, amount, note } = req.body;
-  const user = findUserById(userId);
-
-  if (!user || user.role !== ROLES.INVESTOR) {
-    return res.status(404).json({ message: 'Investor not found.' });
-  }
-  if (!TX_TYPES.includes(type)) {
-    return res.status(400).json({ message: `Type must be one of: ${TX_TYPES.join(', ')}.` });
-  }
   const value = Number(amount);
+
+  if (!TX_TYPES.includes(type)) {
+    return res
+      .status(400)
+      .json({ message: `Type must be one of: ${TX_TYPES.join(', ')}.` });
+  }
   if (!Number.isFinite(value) || value <= 0) {
     return res.status(400).json({ message: 'Amount must be a positive number.' });
   }
   if (!note || !String(note).trim()) {
     return res.status(400).json({ message: 'A note is required for every entry.' });
   }
-  if ((type === 'withdrawal' || type === 'loss') &&
-      value > summarize(user).portfolioValue) {
-    return res.status(400).json({ message: 'Amount exceeds current balance.' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const found = await client.query(
+      `SELECT id FROM users WHERE id = $1 AND role = 'investor' FOR UPDATE`,
+      [Number(userId)]
+    );
+    if (!found.rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Investor not found.' });
+    }
+
+    const current = await getSummary(client, found.rows[0].id);
+    if ((type === 'withdrawal' || type === 'loss') && value > current.portfolioValue) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Amount exceeds current balance.' });
+    }
+
+    await client.query(
+      `INSERT INTO ledger (user_id, type, amount, note, recorded_by)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [found.rows[0].id, type, value.toFixed(2), String(note).trim(), req.user.id]
+    );
+    const updated = await getSummary(client, found.rows[0].id);
+    await client.query('COMMIT');
+    res.json({ message: 'Entry recorded.', ...updated });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
   }
+}));
 
-  user.ledger.push({
-    id: user.ledger.length + 1,
-    date: new Date().toISOString(),
-    type,
-    amount: round2(value),
-    note: String(note).trim(),
-    recordedBy: req.user.id,
-  });
-
-  res.json({ message: 'Entry recorded.', ...summarize(user) });
-});
-
-// Admin: change account status
-app.post('/api/admin/status', authenticateToken, requireAdmin, (req, res) => {
+app.post('/api/admin/status', authenticateToken, requireAdmin, wrap(async (req, res) => {
   const { userId, status } = req.body;
-  const user = findUserById(userId);
-  if (!user || user.role !== ROLES.INVESTOR) {
-    return res.status(404).json({ message: 'Investor not found.' });
-  }
-  if (!STATUSES.includes(status)) {
-    return res.status(400).json({ message: `Status must be one of: ${STATUSES.join(', ')}.` });
-  }
-  user.accountStatus = status;
-  res.json({ message: 'Status updated.', status });
-});
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+  if (!STATUSES.includes(status)) {
+    return res
+      .status(400)
+      .json({ message: `Status must be one of: ${STATUSES.join(', ')}.` });
+  }
+  const { rowCount } = await pool.query(
+    `UPDATE users SET account_status = $1 WHERE id = $2 AND role = 'investor'`,
+    [status, Number(userId)]
+  );
+  if (!rowCount) return res.status(404).json({ message: 'Investor not found.' });
+  res.json({ message: 'Status updated.', status });
+}));
+
+// Start
+initDb()
+  .then(() => app.listen(PORT, () => console.log(`Server running on port ${PORT}`)))
+  .catch((err) => {
+    console.error('Failed to start:', err);
+    process.exit(1);
+  });
