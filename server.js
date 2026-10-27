@@ -24,6 +24,8 @@ const ROLES = { INVESTOR: 'investor', ADMIN: 'admin' };
 const STATUSES = ['active', 'frozen', 'pending_verification'];
 const TX_TYPES = ['deposit', 'withdrawal', 'profit', 'loss'];
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MAX_AMOUNT = 10000000;
+const MAX_PENDING = 5;
 
 // Database
 const pool = new Pool({
@@ -50,6 +52,20 @@ async function initDb() {
       note TEXT NOT NULL,
       recorded_by INTEGER NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS requests (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      type TEXT NOT NULL CHECK (type IN ('deposit', 'withdrawal')),
+      amount NUMERIC(14,2) NOT NULL CHECK (amount > 0),
+      note TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      reviewed_at TIMESTAMPTZ,
+      reviewed_by INTEGER
     );
   `);
 
@@ -217,12 +233,83 @@ app.get('/api/dashboard', authenticateToken, wrap(async (req, res) => {
     [user.id]
   );
 
+  const reqs = await pool.query(
+    `SELECT id, type, amount, note, status, created_at AS date
+     FROM requests WHERE user_id = $1 ORDER BY id DESC LIMIT 20`,
+    [user.id]
+  );
+
   res.json({
     ...summary,
     allowedAssets: user.allowed_assets,
     status: user.account_status,
     transactions: tx.rows.map((t) => ({ ...t, amount: Number(t.amount) })),
+    requests: reqs.rows.map((r) => ({ ...r, amount: Number(r.amount) })),
   });
+}));
+
+app.post('/api/requests', authenticateToken, wrap(async (req, res) => {
+  const { type, amount, note } = req.body;
+  const value = Number(amount);
+
+  if (!['deposit', 'withdrawal'].includes(type)) {
+    return res.status(400).json({ message: 'Type must be deposit or withdrawal.' });
+  }
+  if (!Number.isFinite(value) || value <= 0 || value > MAX_AMOUNT) {
+    return res.status(400).json({ message: 'Enter a valid amount.' });
+  }
+  const cleanNote = String(note || '').trim().slice(0, 200);
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const found = await client.query(
+      `SELECT id, account_status FROM users
+       WHERE id = $1 AND role = 'investor' FOR UPDATE`,
+      [req.user.id]
+    );
+    const user = found.rows[0];
+    if (!user) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Investor not found.' });
+    }
+    if (user.account_status !== 'active') {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ message: 'Your account must be active to make requests.' });
+    }
+
+    const pending = await client.query(
+      `SELECT COUNT(*)::int AS n,
+              COALESCE(SUM(CASE WHEN type = 'withdrawal' THEN amount END), 0) AS withdrawals
+       FROM requests WHERE user_id = $1 AND status = 'pending'`,
+      [user.id]
+    );
+    if (pending.rows[0].n >= MAX_PENDING) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'You have too many pending requests. Please wait for a review.' });
+    }
+
+    if (type === 'withdrawal') {
+      const summary = await getSummary(client, user.id);
+      const available = summary.portfolioValue - Number(pending.rows[0].withdrawals);
+      if (value > available) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'Amount exceeds your available balance.' });
+      }
+    }
+
+    await client.query(
+      `INSERT INTO requests (user_id, type, amount, note) VALUES ($1, $2, $3, $4)`,
+      [user.id, type, value.toFixed(2), cleanNote]
+    );
+    await client.query('COMMIT');
+    res.status(201).json({ message: 'Request submitted. You will see it here once it is reviewed.' });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 }));
 
 // Admin routes
@@ -309,6 +396,70 @@ app.post('/api/admin/status', authenticateToken, requireAdmin, wrap(async (req, 
   );
   if (!rowCount) return res.status(404).json({ message: 'Investor not found.' });
   res.json({ message: 'Status updated.', status });
+}));
+
+app.get('/api/admin/requests', authenticateToken, requireAdmin, wrap(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT r.id, r.type, r.amount, r.note, r.created_at AS date, u.email
+     FROM requests r JOIN users u ON u.id = r.user_id
+     WHERE r.status = 'pending' ORDER BY r.id`
+  );
+  res.json({ requests: rows.map((r) => ({ ...r, amount: Number(r.amount) })) });
+}));
+
+app.post('/api/admin/requests/:id/decision', authenticateToken, requireAdmin, wrap(async (req, res) => {
+  const { decision } = req.body;
+  if (!['approve', 'decline'].includes(decision)) {
+    return res.status(400).json({ message: 'Decision must be approve or decline.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const found = await client.query(
+      `SELECT * FROM requests WHERE id = $1 AND status = 'pending' FOR UPDATE`,
+      [Number(req.params.id)]
+    );
+    const request = found.rows[0];
+    if (!request) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Request not found or already reviewed.' });
+    }
+
+    if (decision === 'approve') {
+      await client.query('SELECT id FROM users WHERE id = $1 FOR UPDATE', [request.user_id]);
+      if (request.type === 'withdrawal') {
+        const summary = await getSummary(client, request.user_id);
+        if (Number(request.amount) > summary.portfolioValue) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ message: 'Amount exceeds the investor\'s current balance.' });
+        }
+      }
+      await client.query(
+        `INSERT INTO ledger (user_id, type, amount, note, recorded_by)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          request.user_id,
+          request.type,
+          request.amount,
+          `Approved request #${request.id}${request.note ? ': ' + request.note : ''}`,
+          req.user.id,
+        ]
+      );
+    }
+
+    await client.query(
+      `UPDATE requests SET status = $1, reviewed_at = NOW(), reviewed_by = $2 WHERE id = $3`,
+      [decision === 'approve' ? 'approved' : 'declined', req.user.id, request.id]
+    );
+    await client.query('COMMIT');
+    res.json({ message: decision === 'approve' ? 'Request approved and recorded.' : 'Request declined.' });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 }));
 
 // Start
