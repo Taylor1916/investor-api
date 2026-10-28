@@ -32,6 +32,11 @@ const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
+// Neon closes idle connections; without this handler the process would crash
+pool.on('error', (err) => {
+  console.error('Unexpected database error:', err.message);
+});
+
 
 async function initDb() {
   await pool.query(`
